@@ -1,0 +1,370 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms
+from PIL import Image
+from scipy.io import loadmat
+from sklearn.metrics import confusion_matrix, classification_report, f1_score, precision_score, recall_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# -----------------------------------------------------
+# 1. Check for GPU
+# -----------------------------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+
+# -----------------------------------------------------
+# 2. Create Custom Dataset
+# -----------------------------------------------------
+class LiverUltrasoundDataset(Dataset):
+    """
+    Custom Dataset for Rat Liver Ultrasound Images.
+    Each case has 15 planes (images), and labels are per case.
+    """
+
+    def __init__(self, images_dir, label_path, transform=None):
+        """
+        Args:
+            images_dir (str): Directory with all the images.
+            label_path (str): Path to the label.mat file.
+            transform (callable, optional): Optional transform to be applied
+                on a sample.
+        """
+        super().__init__()
+        self.images_dir = images_dir
+        self.transform = transform
+
+        # Load labels from .mat file
+        data = loadmat(label_path)
+        print("Keys found in label.mat:", data.keys())  # Debug
+
+        # Extract 'label_2class' and flatten to 1D array
+        if 'label_2class' not in data:
+            raise KeyError("The key 'label_2class' was not found in label.mat")
+        self.labels_per_case = data['label_2class'].flatten()  # Shape: (46,)
+
+        # Verify that there are 46 labels
+        if len(self.labels_per_case) != 46:
+            raise ValueError(f"Expected 46 labels, but got {len(self.labels_per_case)}")
+
+        # Gather all image file paths and their corresponding labels
+        self.image_paths = []
+        self.image_labels = []
+
+        for case_num in range(1, 47):  # Cases 1 to 46
+            label = int(self.labels_per_case[case_num - 1])
+            for plane_num in range(1, 16):  # Planes 1 to 15
+                img_filename = f"SWAVE{case_num}_{plane_num}.png"
+                img_path = os.path.join(images_dir, img_filename)
+                if not os.path.isfile(img_path):
+                    raise FileNotFoundError(f"Image file {img_path} does not exist.")
+                self.image_paths.append(img_path)
+                self.image_labels.append(label)
+
+        assert len(self.image_paths) == 690, f"Expected 690 images, but found {len(self.image_paths)}"
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")  # Ensure 3-channel RGB
+        label = self.image_labels[idx]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+# -----------------------------------------------------
+# 3. Define Transformations (Including Augmentations)
+# -----------------------------------------------------
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(15),
+        transforms.RandomCrop(200),  # Crop to 200x200
+        transforms.Resize((224, 224)),  # Resize back to 224x224
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],  # Using ImageNet mean and std
+                             [0.229, 0.224, 0.225])
+    ]),
+    'test': transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ]),
+}
+
+# -----------------------------------------------------
+# 4. Instantiate the Dataset
+# -----------------------------------------------------
+images_directory = "/home/sjim/UNC Charlotte Dropbox/Salman Jubair Jim/DeepQUS/Data/B-mode Images(15planes)"
+labels_mat_file = "/home/sjim/UNC Charlotte Dropbox/Salman Jubair Jim/DeepQUS/Data/label.mat"
+
+full_dataset = LiverUltrasoundDataset(
+    images_dir=images_directory,
+    label_path=labels_mat_file,
+    transform=None  # We'll set transforms separately for train and test
+)
+
+print(f"Total samples in dataset: {len(full_dataset)}")  # Should be 690
+
+# -----------------------------------------------------
+# 5. Train/Test Split with Stratification
+# -----------------------------------------------------
+from sklearn.model_selection import train_test_split
+
+# Extract all labels
+all_labels = full_dataset.image_labels
+
+# Split indices with stratification to maintain class balance
+train_indices, test_indices = train_test_split(
+    np.arange(len(full_dataset)),
+    test_size=0.2,
+    stratify=all_labels,
+    random_state=42
+)
+
+# Create subsets
+from torch.utils.data import Subset
+
+train_subset = Subset(full_dataset, train_indices)
+test_subset = Subset(full_dataset, test_indices)
+
+# Assign transforms
+train_subset.dataset.transform = data_transforms['train']
+test_subset.dataset.transform = data_transforms['test']
+
+# Create DataLoaders
+batch_size = 32
+
+train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=4)
+test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+print(f"Training set size: {len(train_subset)}")  # 80% of 690 ≈ 552
+print(f"Test set size: {len(test_subset)}")      # 20% of 690 ≈ 138
+
+# -----------------------------------------------------
+# 6. Define a Simple CNN Model
+# -----------------------------------------------------
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes=2):
+        super(SimpleCNN, self).__init__()
+        # Define the CNN layers
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),  # (N, 3, 224, 224) -> (N, 16, 224, 224)
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # (N, 16, 112, 112)
+
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),  # (N, 32, 112, 112)
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # (N, 32, 56, 56)
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),  # (N, 64, 56, 56)
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # (N, 64, 28, 28)
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(64 * 28 * 28, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        x = self.classifier(x)
+        return x
+
+# Instantiate the model and move to device
+model = SimpleCNN(num_classes=2).to(device)
+print(model)
+
+# -----------------------------------------------------
+# 7. Define Loss and Optimizer
+# -----------------------------------------------------
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# Optionally, define a learning rate scheduler
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+
+# -----------------------------------------------------
+# 8. Training Loop
+# -----------------------------------------------------
+num_epochs = 30  # Adjust as needed
+
+best_test_accuracy = 0.0
+best_model_wts = None
+
+for epoch in range(num_epochs):
+    print(f"\nEpoch {epoch + 1}/{num_epochs}")
+    print("-" * 10)
+
+    # Training phase
+    model.train()
+    running_loss = 0.0
+    running_corrects = 0
+
+    for images, labels in train_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        # Zero the parameter gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(images)
+        _, preds = torch.max(outputs, 1)
+        loss = criterion(outputs, labels)
+
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+
+        # Statistics
+        running_loss += loss.item() * images.size(0)
+        running_corrects += torch.sum(preds == labels.data)
+
+    epoch_loss = running_loss / len(train_subset)
+    epoch_acc = running_corrects.double() / len(train_subset)
+
+    print(f"Training Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}")
+
+    # Step the scheduler
+    scheduler.step()
+
+    # Evaluation phase
+    model.eval()
+    test_running_corrects = 0
+    test_running_loss = 0.0
+    all_test_labels = []
+    all_test_preds = []
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+            _, preds = torch.max(outputs, 1)
+            loss = criterion(outputs, labels)
+
+            test_running_loss += loss.item() * images.size(0)
+            test_running_corrects += torch.sum(preds == labels.data)
+
+            all_test_labels.extend(labels.cpu().numpy())
+            all_test_preds.extend(preds.cpu().numpy())
+
+    test_loss = test_running_loss / len(test_subset)
+    test_acc = test_running_corrects.double() / len(test_subset)
+
+    # Calculate F1 Score and Precision
+    f1 = f1_score(all_test_labels, all_test_preds)
+    precision = precision_score(all_test_labels, all_test_preds)
+    recall = recall_score(all_test_labels, all_test_preds)
+
+    print(f"Test Loss: {test_loss:.4f} Acc: {test_acc:.4f} Precision: {precision:.4f} Recall: {recall:.4f} F1: {f1:.4f}")
+
+    # Save the best model
+    if test_acc > best_test_accuracy:
+        best_test_accuracy = test_acc
+        best_model_wts = model.state_dict()
+
+# Load best model weights
+if best_model_wts is not None:
+    model.load_state_dict(best_model_wts)
+    print(f"\nBest Test Accuracy: {best_test_accuracy:.4f}")
+
+# -----------------------------------------------------
+# 9. Detailed Evaluation: Confusion Matrix & Classification Report
+# -----------------------------------------------------
+# Assuming all_test_labels and all_test_preds are already populated
+cm = confusion_matrix(all_test_labels, all_test_preds)
+report = classification_report(all_test_labels, all_test_preds, target_names=["Class 0", "Class 1"])
+
+print("\nConfusion Matrix:")
+print(cm)
+
+print("\nClassification Report:")
+print(report)
+
+# -----------------------------------------------------
+# 10. Visualize Confusion Matrix
+# -----------------------------------------------------
+def plot_confusion_matrix(cm, class_names, title='Confusion Matrix', cmap='Blues'):
+    """
+    Plots a confusion matrix using seaborn heatmap.
+
+    Args:
+        cm (array-like): Confusion matrix.
+        class_names (list): List of class names.
+        title (str): Title of the plot.
+        cmap (str): Color map.
+    """
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap=cmap,
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title(title)
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.show()
+
+class_names = ["Class 0", "Class 1"]
+plot_confusion_matrix(cm, class_names)
+
+# -----------------------------------------------------
+# 11. Save the Model (Optional)
+# -----------------------------------------------------
+# torch.save(model.state_dict(), 'best_liver_ultrasound_cnn.pth')
+# After training, store losses and accuracies in lists
+train_losses = []
+test_losses = []
+test_accuracies = []
+
+# Append these values inside your training loop
+# e.g.,
+# train_losses.append(epoch_loss)
+# test_losses.append(test_loss)
+# test_accuracies.append(test_acc.item())
+
+# Plotting
+plt.figure(figsize=(12, 5))
+
+# Loss Curve
+plt.subplot(1, 2, 1)
+plt.plot(train_losses, label='Training Loss')
+plt.plot(test_losses, label='Test Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Loss Curve')
+plt.legend()
+
+# Accuracy Curve
+plt.subplot(1, 2, 2)
+plt.plot(test_accuracies, label='Test Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Accuracy Curve')
+plt.legend()
+
+plt.show()
+
+
