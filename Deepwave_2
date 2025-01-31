@@ -1,0 +1,222 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms
+from PIL import Image
+from scipy.io import loadmat
+from sklearn.metrics import confusion_matrix, classification_report
+
+# -----------------------------------------------------
+# 1. Check for GPU
+# -----------------------------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+
+# -----------------------------------------------------
+# 2. Create Custom Dataset
+# -----------------------------------------------------
+class LiverDataset(Dataset):
+    """
+    Custom Dataset to load rat liver images (SWAVE_1.png, SWAVE_2.png, etc.)
+    along with their labels (0 or 1) from label_2class in label.mat.
+    """
+
+    def __init__(self, images_dir, label_path, transform=None):
+        super().__init__()
+        self.images_dir = images_dir
+        self.transform = transform
+
+        # Load the .mat file
+        data = loadmat(label_path)
+        print("Keys found in mat file:", data.keys())  # Debug to see available keys
+
+        # IMPORTANT: Change 'label_2class' to the correct key if it differs
+        self.labels = data['label_2class'].flatten()  # shape: (46,) if there are 46 images
+
+        # Build image paths
+        num_images = len(self.labels)
+        self.image_paths = []
+        for i in range(1, num_images + 1):
+            # If your image extension is not .png, please update accordingly
+            img_filename = f"SWAVE_{i}.png"
+            full_path = os.path.join(images_dir, img_filename)
+            self.image_paths.append(full_path)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+
+        label = int(self.labels[idx])  # ensure it's an integer
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+# -----------------------------------------------------
+# 3. Define Transformations
+# -----------------------------------------------------
+# Basic transforms: resize to 224x224, convert to tensor
+# (Add normalization or data augmentation if desired)
+basic_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+# -----------------------------------------------------
+# 4. Instantiate the Dataset
+# -----------------------------------------------------
+images_directory = "/home/sjim/UNC Charlotte Dropbox/Salman Jubair Jim/DeepQUS/Data"
+labels_mat_file = os.path.join(images_directory, "label.mat")
+
+dataset = LiverDataset(
+    images_dir=images_directory,
+    label_path=labels_mat_file,
+    transform=basic_transform
+)
+
+print(f"Total samples in dataset: {len(dataset)}")
+
+# -----------------------------------------------------
+# 5. Train/Test Split
+# -----------------------------------------------------
+# We'll do an 80/20 split
+train_size = int(0.8 * len(dataset))
+test_size = len(dataset) - train_size
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+batch_size = 4  # with only 46 images, a small batch size is okay
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+print(f"Training set size: {train_size}")
+print(f"Test set size: {test_size}")
+
+
+# -----------------------------------------------------
+# 6. Define a Simple CNN Model
+# -----------------------------------------------------
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes=2):
+        super(SimpleCNN, self).__init__()
+        # A small network, just for demonstration
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(in_channels=3, out_channels=8, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+        self.layer2 = nn.Sequential(
+            nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+        # After two MaxPool2d layers on a 224x224 image:
+        #   1st pool -> 112x112
+        #   2nd pool -> 56x56
+        # So the flattened size = 16 * 56 * 56 = 50176
+        self.fc = nn.Linear(16 * 56 * 56, num_classes)
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        x = self.fc(x)
+        return x
+
+
+model = SimpleCNN(num_classes=2).to(device)
+
+# -----------------------------------------------------
+# 7. Define Loss and Optimizer
+# -----------------------------------------------------
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# -----------------------------------------------------
+# 8. Training Loop
+# -----------------------------------------------------
+num_epochs = 100
+
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+
+    for images, labels in train_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    epoch_loss = running_loss / len(train_loader.dataset)
+
+    # Evaluate on the test set each epoch
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    accuracy = correct / total
+    print(f"Epoch [{epoch + 1}/{num_epochs}]  Loss: {epoch_loss:.4f}  Test Accuracy: {accuracy:.4f}")
+
+# -----------------------------------------------------
+# 9. Detailed Evaluation: Confusion Matrix & Classification Report
+# -----------------------------------------------------
+all_labels = []
+all_preds = []
+
+model.eval()
+with torch.no_grad():
+    for images, labels in test_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        _, predicted = torch.max(outputs, 1)
+
+        # Collect for metrics
+        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(predicted.cpu().numpy())
+
+# Confusion Matrix
+cm = confusion_matrix(all_labels, all_preds)
+print("\nConfusion Matrix:")
+print(cm)
+
+# Classification Report (precision, recall, f1-score)
+report = classification_report(all_labels, all_preds, target_names=["Class 0", "Class 1"])
+print("\nClassification Report:")
+print(report)
+
+from sklearn.metrics import confusion_matrix
+import numpy as np
+
+# Suppose after inference, you have:
+#   all_labels = [0, 1, 1, 0, ...]
+#   all_preds  = [0, 1, 0, 0, ...]
+
+# 1. Compute confusion matrix
+cm = confusion_matrix(all_labels, all_preds)
+
+# 2. Print it in text form
+print("Confusion Matrix:")
+print(cm)
